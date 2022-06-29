@@ -1,0 +1,302 @@
+
+R version 4.0.3 (2020-10-10) -- "Bunny-Wunnies Freak Out"
+Copyright (C) 2020 The R Foundation for Statistical Computing
+Platform: x86_64-pc-linux-gnu (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+* Project '~/lmtpcmprsk_aki' loaded. [renv 0.15.1]
+> # set package library via renv
+> renv::activate(here::here())
+* Project '~/lmtpcmprsk_aki' loaded. [renv 0.15.1]
+> 
+> # read in command line arguments and print for logging
+> args <- R.utils::commandArgs(
++   trailingOnly = TRUE,
++   asValues = TRUE,
++   defaults = list(
++     int_type = "mtp", # "static"
++     est_type = "sdr"  # "tmle"
++   )
++ )
+> print(args)
+$int_type
+[1] "mtp"
+
+$est_type
+[1] "tmle"
+
+> 
+> # load packages and helpers
+> library(here)
+here() starts at /global/home/users/nhejazi/lmtpcmprsk_aki
+> library(sl3)
+> library(lmtp)
+NOT MAIN VERSION OF LMTP! THIS IS THE SL3 COMPATIBLE VERSION.
+> library(tidyverse)
+── Attaching packages ─────────────────────────────────────── tidyverse 1.3.1 ──
+✔ ggplot2 3.3.5     ✔ purrr   0.3.4
+✔ tibble  3.1.6     ✔ dplyr   1.0.7
+✔ tidyr   1.1.4     ✔ stringr 1.4.0
+✔ readr   2.1.1     ✔ forcats 0.5.1
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ dplyr::filter() masks stats::filter()
+✖ dplyr::lag()    masks stats::lag()
+> library(future)
+> library(future.apply)
+> library(earth)
+Loading required package: Formula
+Loading required package: plotmo
+Loading required package: plotrix
+Loading required package: TeachingDemos
+> library(arm)
+Loading required package: MASS
+
+Attaching package: ‘MASS’
+
+The following object is masked from ‘package:dplyr’:
+
+    select
+
+Loading required package: Matrix
+
+Attaching package: ‘Matrix’
+
+The following objects are masked from ‘package:tidyr’:
+
+    expand, pack, unpack
+
+Loading required package: lme4
+
+arm (Version 1.12-2, built: 2021-10-15)
+
+Working directory is /global/home/users/nhejazi/lmtpcmprsk_aki
+
+
+Attaching package: ‘arm’
+
+The following object is masked from ‘package:plotrix’:
+
+    rescale
+
+> library(glmnet)
+Loaded glmnet 4.1-2
+> library(speedglm)
+> library(ranger)
+
+Attaching package: ‘ranger’
+
+The following object is masked from ‘package:sl3’:
+
+    importance
+
+> library(xgboost)
+
+Attaching package: ‘xgboost’
+
+The following object is masked from ‘package:dplyr’:
+
+    slice
+
+> library(conflicted)
+> conflict_prefer("filter", "dplyr")
+[conflicted] Will prefer dplyr::filter over any other package
+> conflict_prefer("select", "dplyr")
+[conflicted] Will prefer dplyr::select over any other package
+> source(here("R", "sl_lib.R"))
+> set.seed(11249)
+> 
+> # useful constants
+> trim <- 0.995     # propensity score trimming?
+> folds <- 5        # "outer" folds for cross-fitting
+> SL_folds <- 5     # "inner" folds for super learning
+> k <- 2            # how much history is used at each t
+> 
+> # parallelize and fix multithreading
+> progressr::handlers(global = TRUE)
+> if (availableCores() < 10L) {
++   plan(multicore)
++ } else {
++   # NOTE: bookkeeping for future topologies
++   plan(list(
++     tweak(multicore, workers = availableCores() %/% SL_folds),
++     tweak(multicore, workers = SL_folds - 1L)
++   ))
++ }
+> openblasctl::openblas_set_num_threads(1L)
+> OpenMPController::omp_set_num_threads(1L)
+[[1]]
+[1] 1
+
+> 
+> # load data and set outcome days window
+> dat_lmtp <- read_rds(here("data", "derived", "dat_final.rds"))
+> outcome_day <- 14
+> padded_days <- str_pad(0:(outcome_day - 1), 2, pad = "0")
+> padded_days_out <- str_pad(1:outcome_day, 2, pad = "0")
+> 
+> # set parameters of outcome, trt, and adjustment vars
+> a <-  paste0("I_", padded_days) # treatment
+> bs <- dat_lmtp %>% # baseline covariates
++   select(-id, -fu, -event,
++          -starts_with("L_"), -starts_with("C_"),
++          -starts_with("Y_"), -starts_with("A_"),
++          -starts_with("I_"), -starts_with("CR_"),
++          -starts_with("H_")) %>% names()
+> y <- paste0("Y_",padded_days_out) # outcome (AKI)
+> cr <- paste0("CR_",padded_days_out) # competing risk (death)
+> censoring <- paste0("C_",padded_days) # observed at next time
+> 
+> used_letters <- dat_lmtp %>% # letters for time varying
++   select(starts_with("L_"),
++          starts_with("A_"),
++          -starts_with("L_NA_"),
++          -ends_with(paste0("_",outcome_day))) %>%
++   names()
+> tv <- map(0:(outcome_day - 1), function(x) { # list for time varying covars
++   used_letters[str_detect(used_letters, str_pad(x, 2, pad = "0"))]
++ })
+> 
+> # MTP is to delay everyone's intubation (I_* == 2) by 1 day.
+> # Instead, set them to non-invasive supp O2 (I_* == 1)
+> mtp <- function(data, trt) {
++   # extract time point
++   tau <- readr::parse_number(trt)
++   # get the col name of previous trt
++   trt_prev <- paste0("I_", stringr::str_pad(tau - 1, 2, "left", "0"))
++ 
++   if(trt == "I_00") {
++     # if first time point and intubated, set to 1
++     data[data[[trt]] == 2, trt] <- 1
++   } else {
++     # if intubated at time T but not T-1, set to 1
++     data[which(data[[trt]] == 2 & data[[trt_prev]] != 2), trt] <- 1
++   }
++   return(data[[trt]])
++ }
+> 
+> # set intervention type to MTP or null static intervention
+> shift_fun <- if (args$int_type == "mtp") {
++   mtp
++ } else {
++   NULL
++ }
+> 
+> # estimation of LMTP-based effects
+> if (args$est_type == "sdr") {
++   # loop over time-points to estimate P(T >= t) at given t
++   out_all_t <- future_lapply(seq_len(outcome_day), function(this_time) {
++     # estimate survival probability under LMTP at given t
++     # NOTE (special case): not really survival at t = 1, and package fails
++     out <-
++       lmtp_sdr(
++         dat_lmtp,
++         trt = a[seq_len(this_time)],
++         outcome = y[seq_len(this_time)],
++         comp_risk = cr[seq_len(this_time)],
++         baseline = bs,
++         time_vary = tv[seq_len(this_time)],
++         cens = censoring[seq_len(this_time)],
++         shift = shift_fun,
++         outcome_type = ifelse(this_time == 1, "binomial", "survival"),
++         learners_outcome = learner_stack,
++         learners_trt = learner_stack,
++         folds = folds,
++         .SL_folds = SL_folds,
++         .trim = trim,
++         k = k,
++         intervention_type = ifelse(args$int_type == "mtp", "mtp", "static")
++       )
++ 
++     # NOTE: at t = 1, estimating P(Y = 1), which is incompatible with survival
++     # instead, survival would be ~= P(Y = 0) = 1 - P(Y = 1)
++     if (this_time == 1) {
++       # simple delta method for point and EIF estimates, set CI multiplier
++       ci_mult <- abs(qnorm(p = (0.05) / 2))
++       out$theta <- est <- 1 - out$theta
++       out$eif <- eif <- 1 - out$eif
++       out$standard_error <- std_err <- sqrt(var(eif) / length(eif))
++ 
++       # binary outcome: compute on logit scale and back-transform for safety
++       est_logit <- qlogis(est)
++       gradient_est <- (1 / est) + (1 / (1 - est))
++       std_err_logit <- sqrt(gradient_est^2 * std_err^2)
++       out$low <- ci_lwr <- plogis(est_logit - ci_mult * std_err_logit)
++       out$high <- ci_upr <- plogis(est_logit + ci_mult * std_err_logit)
++     }
++ 
++     # output
++     return(out)
++   }, future.seed = TRUE)
++ 
++ } else if (args$est_type == "tmle") {
++   # loop over time-points to estimate P(T >= t) at given t
++   out_all_t <- future_lapply(seq_len(outcome_day), function(this_time) {
++     # estimate survival probability under LMTP at given t
++     # NOTE (special case): not really survival at t = 1, and package fails
++     out <-
++       lmtp_tmle(
++         dat_lmtp,
++         trt = a[seq_len(this_time)],
++         outcome = y[seq_len(this_time)],
++         comp_risk = cr[seq_len(this_time)],
++         baseline = bs,
++         time_vary = tv[seq_len(this_time)],
++         cens = censoring[seq_len(this_time)],
++         shift = shift_fun,
++         outcome_type = ifelse(this_time == 1, "binomial", "survival"),
++         learners_outcome = learner_stack,
++         learners_trt = learner_stack,
++         folds = folds,
++         .SL_folds = SL_folds,
++         .trim = trim,
++         k = k,
++         intervention_type = ifelse(args$int_type == "mtp", "mtp", "static")
++       )
++ 
++     # NOTE: at t = 1, estimating P(Y = 1), which is incompatible with survival
++     # instead, survival would be ~= P(Y = 0) = 1 - P(Y = 1)
++     if (this_time == 1) {
++       # simple delta method for point and EIF estimates, set CI multiplier
++       ci_mult <- abs(qnorm(p = (0.05) / 2))
++       out$theta <- est <- 1 - out$theta
++       out$eif <- eif <- 1 - out$eif
++       out$standard_error <- std_err <- sqrt(var(eif) / length(eif))
++ 
++       # binary outcome: compute on logit scale and back-transform for safety
++       est_logit <- qlogis(est)
++       gradient_est <- (1 / est) + (1 / (1 - est))
++       std_err_logit <- sqrt(gradient_est^2 * std_err^2)
++       out$low <- ci_lwr <- plogis(est_logit - ci_mult * std_err_logit)
++       out$high <- ci_upr <- plogis(est_logit + ci_mult * std_err_logit)
++     }
++ 
++     # output
++     return(out)
++   }, future.seed = TRUE)
++ }
+There were 50 or more warnings (use warnings() to see the first 50)
+> 
+> # save results in output directory
+> trim_num <- str_split(as.character(trim), "\\.")[[1]][2]
+> date_stamp <- str_replace_all(Sys.Date(), "-", "")
+> file_to_save <- paste0("lmtp_", args$int_type, "_", args$est_type,
++                        "_tv_locf_", trim_num, "_k", k, "_f", folds,
++                        "_fullcohort_", date_stamp, ".rds")
+> saveRDS(object = out_all_t, file = here("data", "results", file_to_save))
+> 
+> proc.time()
+      user     system    elapsed 
+524546.757   1017.112  31285.646 
