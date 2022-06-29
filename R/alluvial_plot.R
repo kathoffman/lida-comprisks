@@ -10,9 +10,9 @@ loadfonts(device="win") # for times new roman
 dat_lmtp <- read_rds(here::here("data/derived/dat_final.rds")) 
 
 dat_lmtp %>%
-  select(id, event, cr, starts_with("I_")) %>%
+  select(id, event, cr, starts_with("I_")) %>% # exposure data is in wide format, need long
   pivot_longer(cols = starts_with("I_")) %>%
-  mutate(day = parse_number(name),
+  mutate(day = parse_number(name), # redefine exposures for everyone until they leave the study
     status = case_when(value == 0 ~ "No Supp O2",
                        value == 1 ~ "Supp O2",
                        value == 2 ~ "Intubated",
@@ -22,7 +22,7 @@ dat_lmtp %>%
                        )) %>%
   group_by(day, status)
 
-outcome_day <- 14
+outcome_day <- 14 # only show up to day 14 (data extends beyond)
 padded_days <- str_pad(0:(outcome_day-1), 2, pad = "0")
 
 vars_to_group <- paste0("I_",padded_days)
@@ -81,4 +81,6 @@ alluv <-
         
 alluv
 
+# save plots
 ggsave( "graphs/figure_alluvial.pdf", alluv, width=8.5, height=4.7)
+ggsave( "graphs/figure_alluvial.jpg", alluv, width=8.5, height=4.7)
